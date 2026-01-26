@@ -26,6 +26,11 @@
 
 #define LV_WL_SHM_BUF_COUNT 2
 
+static inline uint32_t shm_align_stride(uint32_t stride)
+{
+    return (stride + 3u) & ~3u;
+}
+
 /**********************
  *      TYPEDEFS
  **********************/
@@ -186,7 +191,8 @@ static lv_wl_shm_display_data_t * shm_create_display_data(lv_wl_shm_ctx_t * ctx,
     const int32_t phy_width = lv_display_get_original_horizontal_resolution(display);
     const int32_t phy_height = lv_display_get_original_vertical_resolution(display);
     const uint32_t phy_stride = lv_draw_buf_width_to_stride(phy_width, cf);
-    const size_t phy_buf_size = phy_stride * phy_height;
+    const uint32_t phy_stride_aligned = shm_align_stride(phy_stride);
+    const size_t phy_buf_size = phy_stride_aligned * phy_height;
 
     ddata->mmap_size = phy_buf_size * LV_WL_SHM_BUF_COUNT;
 
@@ -211,7 +217,7 @@ static lv_wl_shm_display_data_t * shm_create_display_data(lv_wl_shm_ctx_t * ctx,
     for(size_t i = 0; i < LV_WL_SHM_BUF_COUNT; ++i) {
         size_t offset = i * phy_buf_size;
         ddata->buffers[i].wl_buffer =
-            wl_shm_pool_create_buffer(ddata->pool, offset, phy_width, phy_height, phy_stride, ddata->shm_cf);
+            wl_shm_pool_create_buffer(ddata->pool, offset, phy_width, phy_height, phy_stride_aligned, ddata->shm_cf);
 
         if(!ddata->buffers[i].wl_buffer) {
             LV_LOG_ERROR("Failed to create wl_buffer %zu", i);
@@ -236,9 +242,10 @@ static lv_wl_shm_display_data_t * shm_create_display_data(lv_wl_shm_ctx_t * ctx,
                                buf_size, LV_DISPLAY_RENDER_MODE_DIRECT);
     }
     else {
-        lv_display_set_buffers(display, ddata->mmap_ptr,
-                               (uint8_t *)ddata->mmap_ptr + phy_buf_size,
-                               phy_buf_size, LV_DISPLAY_RENDER_MODE_DIRECT);
+        lv_display_set_buffers_with_stride(display, ddata->mmap_ptr,
+                                           (uint8_t *)ddata->mmap_ptr + phy_buf_size,
+                                           phy_buf_size, phy_stride_aligned,
+                                           LV_DISPLAY_RENDER_MODE_DIRECT);
     }
 
     return ddata;
@@ -428,7 +435,7 @@ static void shm_flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * 
 
         const int32_t phy_width = lv_display_get_original_horizontal_resolution(disp);
         const int32_t phy_height = lv_display_get_original_vertical_resolution(disp);
-        const uint32_t dest_stride = lv_draw_buf_width_to_stride(phy_width, cf);
+        const uint32_t dest_stride = shm_align_stride(lv_draw_buf_width_to_stride(phy_width, cf));
 
         size_t buf_size = dest_stride * phy_height;
         uint8_t * wl_buf = (uint8_t *)ddata->mmap_ptr + (ddata->curr_wl_buffer_idx * buf_size);
