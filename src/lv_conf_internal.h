@@ -31,6 +31,12 @@
 #define LV_DRAW_SW_ASM_RISCV_V          3
 #define LV_DRAW_SW_ASM_CUSTOM           255
 
+#define LV_NEMA_LIB_NONE            0
+#define LV_NEMA_LIB_M33_REVC        1
+#define LV_NEMA_LIB_M33_NEMAPVG     2
+#define LV_NEMA_LIB_M55             3
+#define LV_NEMA_LIB_M7              4
+
 #define LV_NEMA_HAL_CUSTOM          0
 #define LV_NEMA_HAL_STM32           1
 
@@ -660,6 +666,23 @@
 #endif
 
 #if LV_USE_NEMA_GFX
+    /** Select which NemaGFX static library headers to use. Possible options:
+     * - LV_NEMA_LIB_NONE           an alias of LV_NEMA_LIB_M33_REVC
+     * - LV_NEMA_LIB_M33_REVC
+     * - LV_NEMA_LIB_M33_NEMAPVG
+     * - LV_NEMA_LIB_M55
+     * - LV_NEMA_LIB_M7
+     * You must also take care to link the correct corresponding static library
+     * in libs/nema_gfx/lib/core/
+     */
+    #ifndef LV_USE_NEMA_LIB
+        #ifdef CONFIG_LV_USE_NEMA_LIB
+            #define LV_USE_NEMA_LIB CONFIG_LV_USE_NEMA_LIB
+        #else
+            #define LV_USE_NEMA_LIB LV_NEMA_LIB_NONE
+        #endif
+    #endif
+
     /** Select which NemaGFX HAL to use. Possible options:
      * - LV_NEMA_HAL_CUSTOM
      * - LV_NEMA_HAL_STM32 */
@@ -676,6 +699,18 @@
                 #define LV_NEMA_STM32_HAL_INCLUDE CONFIG_LV_NEMA_STM32_HAL_INCLUDE
             #else
                 #define LV_NEMA_STM32_HAL_INCLUDE <stm32u5xx_hal.h>
+            #endif
+        #endif
+
+        /** Set it to a value like __attribute__((section("Nemagfx_Memory_Pool_Buffer")))
+         * and define the section in the linker script if you need the GPU memory to
+         * be, e.g. in a region where accesses will not be cached.
+         */
+        #ifndef LV_NEMA_STM32_HAL_ATTRIBUTE_POOL_MEM
+            #ifdef CONFIG_LV_NEMA_STM32_HAL_ATTRIBUTE_POOL_MEM
+                #define LV_NEMA_STM32_HAL_ATTRIBUTE_POOL_MEM CONFIG_LV_NEMA_STM32_HAL_ATTRIBUTE_POOL_MEM
+            #else
+                #define LV_NEMA_STM32_HAL_ATTRIBUTE_POOL_MEM
             #endif
         #endif
     #endif
@@ -1132,7 +1167,14 @@
         #ifdef CONFIG_LV_USE_PPA_IMG
             #define LV_USE_PPA_IMG CONFIG_LV_USE_PPA_IMG
         #else
-            #define LV_USE_PPA_IMG 0
+            #define LV_USE_PPA_IMG      0
+        #endif
+    #endif
+    #ifndef LV_PPA_BURST_LENGTH
+        #ifdef CONFIG_LV_PPA_BURST_LENGTH
+            #define LV_PPA_BURST_LENGTH CONFIG_LV_PPA_BURST_LENGTH
+        #else
+            #define LV_PPA_BURST_LENGTH    128
         #endif
     #endif
 #endif
@@ -3909,15 +3951,6 @@
 
 #endif /*LV_USE_TEST*/
 
-/** Enable loading XML UIs runtime */
-#ifndef LV_USE_XML
-    #ifdef CONFIG_LV_USE_XML
-        #define LV_USE_XML CONFIG_LV_USE_XML
-    #else
-        #define LV_USE_XML    0
-    #endif
-#endif
-
 /** 1: Enable text translation support */
 #ifndef LV_USE_TRANSLATION
     #ifdef CONFIG_LV_USE_TRANSLATION
@@ -4294,14 +4327,6 @@
             #define LV_USE_LINUX_DRM_GBM_BUFFERS 0
         #endif
     #endif
-
-    #ifndef LV_LINUX_DRM_USE_EGL
-        #ifdef CONFIG_LV_LINUX_DRM_USE_EGL
-            #define LV_LINUX_DRM_USE_EGL CONFIG_LV_LINUX_DRM_USE_EGL
-        #else
-            #define LV_LINUX_DRM_USE_EGL     0
-        #endif
-    #endif
 #endif
 
 /** Interface for TFT_eSPI */
@@ -4517,7 +4542,9 @@
     #endif
 #endif
 
-/** Use a generic OpenGL driver that can be used to embed in other applications or used with GLFW/EGL */
+/** Use a generic OpenGL driver that can be used to embed in other applications or used with GLFW/EGL
+ * - Requires LV_USE_MATRIX.
+ */
 #ifndef LV_USE_OPENGLES
     #ifdef CONFIG_LV_USE_OPENGLES
         #define LV_USE_OPENGLES CONFIG_LV_USE_OPENGLES
@@ -4855,8 +4882,14 @@ LV_EXPORT_CONST_INT(LV_DRAW_BUF_ALIGN);
     #define LV_WAYLAND_USE_EGL 0
 #endif
 
-#if LV_USE_LINUX_DRM == 0
-    #define LV_LINUX_DRM_USE_EGL     0
+#if LV_USE_LINUX_DRM
+    #if LV_USE_OPENGLES
+        #define LV_LINUX_DRM_USE_EGL 1
+    #else
+        #define LV_LINUX_DRM_USE_EGL 0
+    #endif /* LV_USE_OPENGLES */
+#else
+    #define LV_LINUX_DRM_USE_EGL 0
 #endif /*LV_USE_LINUX_DRM*/
 
 #if LV_USE_SYSMON == 0
@@ -4901,13 +4934,20 @@ LV_EXPORT_CONST_INT(LV_DRAW_BUF_ALIGN);
     #endif
 #endif
 
+#if LV_USE_SDL && LV_USE_OPENGLES && (LV_USE_DRAW_OPENGLES || LV_USE_DRAW_NANOVG)
+    #define LV_SDL_USE_EGL 1
+#else
+    #define LV_SDL_USE_EGL 0
+#endif
+
 #ifndef LV_USE_EGL
-    #if LV_LINUX_DRM_USE_EGL || LV_WAYLAND_USE_EGL
+    #if LV_LINUX_DRM_USE_EGL || LV_WAYLAND_USE_EGL || LV_SDL_USE_EGL
         #define LV_USE_EGL 1
     #else
         #define LV_USE_EGL 0
     #endif
 #endif /* LV_USE_EGL */
+
 
 #if LV_USE_OS
     #if (LV_USE_FREETYPE || LV_USE_THORVG) && LV_DRAW_THREAD_STACK_SIZE < (32 * 1024)
