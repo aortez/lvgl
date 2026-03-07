@@ -24,6 +24,8 @@
 
 #include "../../../stdlib/lv_sprintf.h"
 #include "../../../draw/lv_draw_buf.h"
+#include "../../../draw/sw/lv_draw_sw.h"
+#include "../../../display/lv_display_private.h"
 
 #if LV_USE_LINUX_DRM_GBM_BUFFERS
     #include <gbm.h>
@@ -78,6 +80,11 @@ typedef struct {
     drmModePropertyPtr conn_props[128];
     drm_buffer_t drm_bufs[BUFFER_CNT];
     drm_buffer_t * act_buf;
+    lv_display_rotation_t rotation;
+    uint8_t * rotated_buf;
+    size_t rotated_buf_size;
+    uint8_t * draw_buf_1;
+    uint8_t * draw_buf_2;
 #if LV_USE_LINUX_DRM_GBM_BUFFERS
     struct gbm_device * gbm_device;
 #endif
@@ -175,11 +182,21 @@ static void drm_dmabuf_set_active_buf(lv_event_t * event)
 
     if(drm_dev->act_buf == NULL) {
 
-        for(i = 0; i < BUFFER_CNT; i++) {
-            if(act_buf->unaligned_data == drm_dev->drm_bufs[i].map) {
-                drm_dev->act_buf = &drm_dev->drm_bufs[i];
-                LV_LOG_TRACE("Set active buffer idx: %d", i);
-                break;
+        if(drm_dev->rotation != LV_DISPLAY_ROTATION_0) {
+            /* With rotation, LVGL uses separate draw buffers so we can't match by pointer.
+             * Alternate between DRM buffers for double-buffering. */
+            static int rot_buf_idx = 0;
+            drm_dev->act_buf = &drm_dev->drm_bufs[rot_buf_idx];
+            rot_buf_idx = (rot_buf_idx + 1) % BUFFER_CNT;
+            LV_LOG_TRACE("Set active buffer idx (rotation): %d", rot_buf_idx);
+        }
+        else {
+            for(i = 0; i < BUFFER_CNT; i++) {
+                if(act_buf->unaligned_data == drm_dev->drm_bufs[i].map) {
+                    drm_dev->act_buf = &drm_dev->drm_bufs[i];
+                    LV_LOG_TRACE("Set active buffer idx: %d", i);
+                    break;
+                }
             }
         }
 
@@ -229,13 +246,39 @@ lv_result_t lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_
 
     size_t buf_size = LV_MIN(drm_dev->drm_bufs[1].size, drm_dev->drm_bufs[0].size);
     uint32_t stride = drm_dev->drm_bufs[0].pitch;
-    /* Resolution must be set first because if the screen is smaller than the size passed
-     * to lv_display_create then the buffers aren't big enough for LV_DISPLAY_RENDER_MODE_DIRECT.
-     */
-    lv_display_set_resolution(disp, hor_res, ver_res);
-    lv_display_set_buffers_with_stride(disp, drm_dev->drm_bufs[1].map, drm_dev->drm_bufs[0].map, buf_size,
-                                       stride, LV_DISPLAY_RENDER_MODE_DIRECT);
 
+    /* Check if rotation is requested. When rotation is non-zero, LVGL handles the
+     * virtual resolution swap internally (e.g. native 480x800 + rotation 270 = virtual 800x480).
+     * We set the native resolution and use separate draw buffers with FULL render mode so
+     * the flush callback can rotate pixels into the native DRM buffer before page-flipping. */
+    lv_display_rotation_t rotation = lv_display_get_rotation(disp);
+    drm_dev->rotation = rotation;
+
+    /* Resolution is always set to native panel dimensions. LVGL swaps internally for rotation. */
+    lv_display_set_resolution(disp, hor_res, ver_res);
+
+    if(rotation != LV_DISPLAY_ROTATION_0) {
+        /* Allocate separate draw buffers for software rotation. Total pixel count
+         * is the same regardless of orientation (hor*ver == ver*hor). */
+        lv_color_format_t cf = lv_display_get_color_format(disp);
+        uint32_t px_size = lv_color_format_get_size(cf);
+        size_t draw_buf_size = hor_res * ver_res * px_size;
+        drm_dev->draw_buf_1 = lv_malloc(draw_buf_size);
+        LV_ASSERT_MALLOC(drm_dev->draw_buf_1);
+        drm_dev->draw_buf_2 = lv_malloc(draw_buf_size);
+        LV_ASSERT_MALLOC(drm_dev->draw_buf_2);
+
+        lv_display_set_buffers(disp, drm_dev->draw_buf_1, drm_dev->draw_buf_2,
+                               draw_buf_size, LV_DISPLAY_RENDER_MODE_FULL);
+
+        LV_LOG_INFO("DRM rotation %d: native %" LV_PRId32 "x%" LV_PRId32,
+                     (int)rotation * 90, hor_res, ver_res);
+    }
+    else {
+        /* No rotation: render directly into DRM buffers (zero-copy). */
+        lv_display_set_buffers_with_stride(disp, drm_dev->drm_bufs[1].map, drm_dev->drm_bufs[0].map, buf_size,
+                                           stride, LV_DISPLAY_RENDER_MODE_DIRECT);
+    }
 
     /* Set the handler that is called before a redraw occurs to set the active buffer/plane
      * when GBM buffers are used the DMA_BUF_SYNC_START is issued there */
@@ -246,7 +289,8 @@ lv_result_t lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_
     }
 
     LV_LOG_INFO("Resolution is set to %" LV_PRId32 "x%" LV_PRId32 " at %" LV_PRId32 "dpi",
-                hor_res, ver_res, lv_display_get_dpi(disp));
+                lv_display_get_horizontal_resolution(disp), lv_display_get_vertical_resolution(disp),
+                lv_display_get_dpi(disp));
     return LV_RESULT_OK;
 }
 
@@ -1068,9 +1112,28 @@ static void drm_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_
 {
     if(!lv_display_flush_is_last(disp)) return;
 
+    drm_dev_t * drm_dev = lv_display_get_driver_data(disp);
+
+    /* When rotation is active, LVGL renders into separate draw buffers at the rotated
+     * resolution. We rotate the pixels into the active DRM buffer before page-flipping. */
+    if(drm_dev->rotation != LV_DISPLAY_ROTATION_0) {
+        LV_ASSERT(drm_dev->act_buf != NULL);
+
+        lv_color_format_t cf = lv_display_get_color_format(disp);
+        int32_t src_w = lv_area_get_width(area);
+        int32_t src_h = lv_area_get_height(area);
+        uint32_t src_stride = lv_draw_buf_width_to_stride(src_w, cf);
+
+        /* Destination is the native DRM buffer. */
+        uint32_t dest_stride = drm_dev->act_buf->pitch;
+
+        lv_draw_sw_rotate(px_map, drm_dev->act_buf->map,
+                          src_w, src_h, src_stride, dest_stride,
+                          drm_dev->rotation, cf);
+    }
+
     LV_UNUSED(area);
     LV_UNUSED(px_map);
-    drm_dev_t * drm_dev = lv_display_get_driver_data(disp);
 
     LV_ASSERT(drm_dev->act_buf != NULL);
 
@@ -1080,7 +1143,6 @@ static void drm_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_
     }
 
     drm_dev->act_buf = NULL;
-
 }
 
 static void drm_del_event_cb(lv_event_t * e)
@@ -1100,6 +1162,11 @@ static void drm_del_event_cb(lv_event_t * e)
         drmModeFreeCrtc(s_crtc);
         drm_dev->saved_crtc = NULL;
     }
+
+    /* Free rotation draw buffers. */
+    if(drm_dev->draw_buf_1) { lv_free(drm_dev->draw_buf_1); drm_dev->draw_buf_1 = NULL; }
+    if(drm_dev->draw_buf_2) { lv_free(drm_dev->draw_buf_2); drm_dev->draw_buf_2 = NULL; }
+    if(drm_dev->rotated_buf) { lv_free(drm_dev->rotated_buf); drm_dev->rotated_buf = NULL; }
 
     /* Prevent further flushes & free any pending atomic request */
     lv_display_set_flush_cb(disp, NULL);
